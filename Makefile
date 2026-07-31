@@ -3,7 +3,7 @@
 # being trustworthy and everyone goes back to pushing and waiting.
 #
 # CI jobs covered: Lint (pre-commit: ruff, shellcheck, shfmt), Shell (bats),
-# Python tests, and Validate plugins and skills.
+# Python tests, JS tests, and Validate plugins and skills.
 #
 # RUFF_VERSION must match the ruff-pre-commit rev in .pre-commit-config.yaml. The
 # validator self-test asserts that; bump both together.
@@ -11,10 +11,10 @@ RUFF_VERSION := 0.14.13
 
 .DEFAULT_GOAL := check
 .NOTPARALLEL:
-.PHONY: check self-test lint shell bats shell-suites python-tests validate fix help
+.PHONY: check self-test lint shell bats shell-suites python-tests js-tests validate fix help
 
 ## check: most of what CI runs (this is the one you want)
-check: self-test lint shell bats python-tests validate
+check: self-test lint shell bats python-tests js-tests validate
 	@echo ""
 	@echo "✓ check passed — most of CI, but not the loadability checks, the"
 	@echo "  version-increment check, or the non-ruff pre-commit hooks."
@@ -94,6 +94,40 @@ python-tests:
 		ran=$$((ran + 1)); \
 	done; \
 	echo "  ran $$ran test director(ies)"; \
+	exit $$failed
+
+## js-tests: plugin workflow suites (node, no dependencies)
+# Two guards, for two different ways this goes quiet. The first is discovery: an empty
+# result must fail, same as the Python target above. The second is execution, because
+# `node <file>` exits 0 on a file that asserted nothing, so each suite has to print a
+# `<n> assertions passed` line with n > 0 before it counts as having run.
+#
+# Matched against the last line only, which is what AGENTS.md asks for. Matched anywhere,
+# a suite that printed its total and then kept going would still satisfy it.
+#
+# Only stdout is captured; stderr is left to flow through to the terminal. Merging the two
+# would put a node warning emitted at exit on the last line and report a fully passing
+# suite as one that ran nothing, and discarding stderr would hide the crash behind it.
+js-tests:
+	@echo "→ js tests"
+	@files=$$(find plugins -type f -name '*.test.mjs' | sort); \
+	if [ -z "$$files" ]; then \
+		echo "  ✗ no .test.mjs files found — discovery is broken"; \
+		exit 1; \
+	fi; \
+	failed=0; ran=0; \
+	for f in $$files; do \
+		echo "  → $$f"; \
+		out=$$(node "$$f") || failed=1; \
+		echo "$$out"; \
+		if ! printf '%s\n' "$$out" | tail -n 1 | \
+			grep -qE '^[1-9][0-9]* assertions passed$$'; then \
+			echo "  ✗ $$f did not end with an assertion count: it ran nothing"; \
+			failed=1; \
+		fi; \
+		ran=$$((ran + 1)); \
+	done; \
+	echo "  ran $$ran js suite(s)"; \
 	exit $$failed
 
 ## validate: plugin metadata, structure, and cross-references

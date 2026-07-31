@@ -216,7 +216,8 @@ make check
 ```
 
 That runs the validator self-test, ruff, shellcheck, shfmt, bats, the plugin
-Python suites, and the plugin validator.
+Python suites, the plugin JS suites, and the plugin validator. It needs `uv`, `shellcheck`,
+`shfmt`, `bats`, and `node` on the machine.
 
 It is most of CI, not all of it. Three things run only in CI, so a green `make check`
 is strong evidence and not a guarantee:
@@ -302,6 +303,12 @@ should — because the self-test is itself a checker.
 Otherwise: `set -euo pipefail`, POSIX ERE rather than PCRE (`grep -oP` is not portable
 to macOS), and never send a tool's stderr to `/dev/null` unless you have handled the
 failure it would have reported.
+
+**A JS suite must print `<n> assertions passed` as its last line, with n > 0.** `node file.mjs`
+exits 0 on a file that asserted nothing, so both `make js-tests` and the CI job grep for that
+line and fail without it. Keep a counter and an expected total, and exit non-zero when they
+disagree — that is what catches a suite which silently stopped running half of itself.
+`plugins/static-analysis/tests/semgrep-scan.test.mjs` is the worked example.
 
 ## Working effectively in this repo
 

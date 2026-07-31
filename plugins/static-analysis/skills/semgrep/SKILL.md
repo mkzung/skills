@@ -8,20 +8,21 @@ description: >-
   to scan code for vulnerabilities, run a security audit with Semgrep, find
   bugs, or perform static analysis. Spawns parallel workers for multi-language
   codebases.
-allowed-tools: Bash Read Glob Task AskUserQuestion TaskCreate TaskList TaskUpdate
+allowed-tools: Bash Read Glob Agent Task Workflow AskUserQuestion TaskCreate TaskList TaskUpdate
 ---
 
 # Semgrep Security Scan
 
-Run a Semgrep scan with automatic language detection, parallel execution via Task subagents, and merged SARIF output.
+Run a Semgrep scan with automatic language detection, parallel execution via a dynamic workflow, and merged SARIF output.
 
 ## Essential Principles
 
 1. **Always use `--metrics=off`** — Semgrep sends telemetry by default; `--config auto` also phones home. Every `semgrep` command must include `--metrics=off` to prevent data leakage during security audits.
 2. **User must approve the scan plan (Step 3 is a hard gate)** — The original "scan this codebase" request is NOT approval. Present exact rulesets, target, engine, and mode; wait for explicit "yes"/"proceed" before spawning scanners.
 3. **Third-party rulesets are required, not optional** — Trail of Bits, 0xdea, and Decurity rules catch vulnerabilities absent from the official registry. Include them whenever the detected language matches.
-4. **Spawn all scan Tasks in a single message** — Parallel execution is the core performance advantage. Never spawn Tasks sequentially; always emit all Task tool calls in one response.
+4. **The workflow generates the commands; do not write them yourself** — `workflows/semgrep-scan.js` builds every `semgrep` line from the approved list. That is what makes `--metrics=off`, the `--include` scoping rule, and the parallel dispatch properties of the code rather than instructions. Pass it the approved rulesets and let it run.
 5. **Always check for Semgrep Pro before scanning** — Pro enables cross-file taint tracking and catches ~250% more true positives. Skipping the check means silently missing critical inter-file vulnerabilities.
+6. **Report what did not run** — The workflow returns `failed` and `skipped` alongside `scans`. A ruleset whose repo would not clone, or one whose agent died, must appear in the report. A partial scan presented as a complete one is worse than no scan.
 
 ## When to Use
 
@@ -68,10 +69,12 @@ The output directory is resolved **once** at the start of Step 1 and used throug
 $OUTPUT_DIR/
 ├── rulesets.txt                 # Approved rulesets (logged after Step 3)
 ├── raw/                         # Per-scan raw output (unfiltered)
-│   ├── python-python.json
+│   ├── python-python.json        # <language>-<ruleset> for language-scoped rules
 │   ├── python-python.sarif
 │   ├── python-django.json
 │   ├── python-django.sarif
+│   ├── all-security-audit.json   # all-<ruleset> for cross-language rules, run once
+│   ├── all-security-audit.sarif
 │   └── ...
 └── results/                     # Final merged output
     └── results.sarif
@@ -84,7 +87,15 @@ $OUTPUT_DIR/
 **Optional:** Semgrep Pro — enables cross-file taint tracking, inter-procedural analysis, and additional languages (Apex, C#, Elixir). Check with:
 
 ```bash
-semgrep --pro --validate --config p/default 2>/dev/null && echo "Pro available" || echo "OSS only"
+# --metrics=off because Principle 1 has no exceptions, and this is the first semgrep command
+# of a run. stderr is kept because "OSS only" has several causes (logged out, no subscription,
+# registry blocked) and the run downgrades silently for all of them.
+if PRO_ERR=$(semgrep --pro --validate --metrics=off --config p/default 2>&1); then
+  echo "Pro available"
+else
+  echo "OSS only"
+  echo "  reason: $(printf '%s' "$PRO_ERR" | tail -n 3)"
+fi
 ```
 
 **Limitations:** OSS mode cannot track data flow across files. Pro mode uses `-j 1` for cross-file analysis (slower per ruleset, but parallel rulesets compensate).
@@ -99,7 +110,7 @@ Select mode in Step 2 of the workflow. Mode affects both scanner flags and post-
 | **Important only** | All rulesets, pre- and post-filtered | Security vulns only, medium-high confidence/impact |
 
 **Important only** applies two filter layers:
-1. **Pre-filter**: `--severity MEDIUM --severity HIGH --severity CRITICAL` (CLI flag)
+1. **Pre-filter**: `--severity WARNING --severity ERROR` (CLI flag)
 2. **Post-filter**: JSON metadata — keeps only `category=security`, `confidence∈{MEDIUM,HIGH}`, `impact∈{MEDIUM,HIGH}`
 
 See [scan-modes.md](references/scan-modes.md) for metadata criteria and jq filter commands.
@@ -108,25 +119,34 @@ See [scan-modes.md](references/scan-modes.md) for metadata criteria and jq filte
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ MAIN AGENT (this skill)                                          │
+│ MAIN SESSION (this skill)                                        │
 │ Step 1: Detect languages + check Pro availability                │
 │ Step 2: Select scan mode + rulesets (ref: rulesets.md)           │
 │ Step 3: Present plan + rulesets, get approval [⛔ HARD GATE]     │
-│ Step 4: Spawn parallel scan Tasks (approved rulesets + mode)     │
-│ Step 5: Merge results and report                                 │
+│ Step 4: Call Workflow with the approved rulesets                 │
+│ Step 5: Post-filter, merge, report, delete repos/                │
 └──────────────────────────────────────────────────────────────────┘
-         │ Step 4
+         │ Step 4: workflows/semgrep-scan.js
          ▼
-┌─────────────────┐
-│ Scan Tasks      │
-│ (parallel)      │
-├─────────────────┤
-│ Python scanner  │
-│ JS/TS scanner   │
-│ Go scanner      │
-│ Docker scanner  │
-└─────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│ Phase: Clone   one agent, each third-party repo once             │
+│ Phase: Scan    one agent per language, plus one shared unit      │
+│                ├── python     p/python, p/django                 │
+│                ├── javascript p/javascript                       │
+│                ├── docker     p/dockerfile                       │
+│                └── cross-language  p/security-audit, p/secrets,  │
+│                                    the cloned repos              │
+└──────────────────────────────────────────────────────────────────┘
 ```
+
+The approval gate stays in the session because workflow agents run in the background and
+cannot ask the user anything. The approved list crosses into the workflow as data, so the
+scan cannot reach a ruleset the user declined.
+
+Cross-language rulesets go in one shared unit rather than being repeated per language.
+`p/security-audit`, `p/secrets`, and the third-party repos scan the whole target unscoped,
+so running them once per language ran the identical command N times and left the SARIF
+merge to dedup the copies.
 
 ## Workflow
 
@@ -137,24 +157,26 @@ See [scan-modes.md](references/scan-modes.md) for metadata criteria and jq filte
 | 1 | Resolve output dir, detect languages + Pro availability | — | Use Glob, not Bash |
 | 2 | Select scan mode + rulesets | — | [rulesets.md](references/rulesets.md) |
 | 3 | Present plan, get explicit approval | ⛔ HARD | AskUserQuestion |
-| 4 | Spawn parallel scan Tasks | — | [scanner-task-prompt.md](references/scanner-task-prompt.md) |
-| 5 | Merge results and report | — | Merge script (below) |
+| 4 | Run the scan workflow | — | `workflows/semgrep-scan.js` |
+| 5 | Post-filter, merge, report, clean up | — | Merge script (below) |
 
 **Task enforcement:** On invocation, create 5 tasks with blockedBy dependencies (each step blocks the previous). Step 3 is a HARD GATE — mark complete ONLY after user explicitly approves.
 
 **Merge command (Step 5):**
 
 ```bash
-uv run {baseDir}/scripts/merge_sarif.py $OUTPUT_DIR/raw $OUTPUT_DIR/results/results.sarif
+uv run {baseDir}/scripts/merge_sarif.py "$OUTPUT_DIR/raw" "$OUTPUT_DIR/results/results.sarif"
 ```
 
-## Agents
+## Workflow and agents
 
-| Agent | Tools | Purpose |
-|-------|-------|---------|
-| `static-analysis:semgrep-scanner` | Bash | Executes parallel semgrep scans for a language category |
+| Component | Purpose |
+|-----------|---------|
+| [workflows/semgrep-scan.js](workflows/semgrep-scan.js) | Builds every scan command from the approved rulesets and runs them in parallel |
+| `static-analysis:semgrep-scanner` | The agent the workflow spawns per unit. Runs the commands it is given; composes none of them |
 
-Use `subagent_type: static-analysis:semgrep-scanner` in Step 4 when spawning Task subagents.
+The workflow passes `agentType: 'static-analysis:semgrep-scanner'` itself. Spawn that agent
+directly only on the fallback path, when the `Workflow` tool is unavailable.
 
 ## Rationalizations to Reject
 
@@ -167,7 +189,9 @@ Use `subagent_type: static-analysis:semgrep-scanner` in Step 4 when spawning Tas
 | "Add extra rulesets without asking" | Modifying approved list without consent breaks trust |
 | "Third-party rulesets are optional" | Trail of Bits, 0xdea, Decurity catch vulnerabilities not in official registry — REQUIRED |
 | "Use --config auto" | Sends metrics; less control over rulesets |
-| "One Task at a time" | Defeats parallelism; spawn all Tasks together |
+| "I'll just run the semgrep commands myself" | The workflow is what enforces `--metrics=off` and the `--include` rule. Hand-written commands drop them silently |
+| "The workflow reported some failures, the scan still finished" | `failed` and `skipped` are part of the result. Report them or the user reads a partial scan as a clean one |
+| "The workflow said the scans succeeded, so they did" | `scans` is the agent's own report. Check each entry's own `json` and `sarif` path with `test -s` before you believe it. Do not compare counts: a scan that lied about succeeding and a `failed` scan that crashed after writing cancel out to the healthy total |
 | "Pro is too slow, skip --pro" | Cross-file analysis catches 250% more true positives; worth the time |
 | "Semgrep handles GitHub URLs natively" | URL handling fails on repos with non-standard YAML; always clone first |
 | "Cleanup is optional" | Cloned repos pollute the user's workspace and accumulate across runs |
@@ -180,11 +204,12 @@ Use `subagent_type: static-analysis:semgrep-scanner` in Step 4 when spawning Tas
 |------|---------|
 | [rulesets.md](references/rulesets.md) | Complete ruleset catalog and selection algorithm |
 | [scan-modes.md](references/scan-modes.md) | Pre/post-filter criteria and jq commands |
-| [scanner-task-prompt.md](references/scanner-task-prompt.md) | Template for spawning scanner subagents |
+| [scanner-task-prompt.md](references/scanner-task-prompt.md) | Scanner prompt template, used only on the fallback path |
 
 | Workflow | Purpose |
 |----------|---------|
 | [scan-workflow.md](workflows/scan-workflow.md) | Complete 5-step scan execution process |
+| [workflows/semgrep-scan.js](workflows/semgrep-scan.js) | The dynamic workflow Step 4 runs |
 
 ## Success Criteria
 
@@ -194,7 +219,9 @@ Use `subagent_type: static-analysis:semgrep-scanner` in Step 4 when spawning Tas
 - [ ] Scan mode selected by user (run all / important only)
 - [ ] Rulesets include third-party rules for all detected languages
 - [ ] User explicitly approved the scan plan (Step 3 gate passed)
-- [ ] All scan Tasks spawned in a single message and completed
+- [ ] Scan workflow ran and returned a result object
+- [ ] `failed` and `skipped` from the workflow are empty, or listed in the report
+- [ ] Every `scans` entry confirmed on disk by its own `json` and `sarif` path, not by file count
 - [ ] Every `semgrep` command used `--metrics=off`
 - [ ] Approved rulesets logged to `$OUTPUT_DIR/rulesets.txt`
 - [ ] Raw per-scan outputs stored in `$OUTPUT_DIR/raw/`

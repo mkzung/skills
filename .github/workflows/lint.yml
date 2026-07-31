@@ -133,3 +133,51 @@ jobs:
           done
           echo "Ran ${#dirs[@]} test directory/ies"
           exit "$failed"
+
+  js-tests:
+    name: JS tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      # Pinned rather than inherited from the runner image. Without this the node major
+      # changes whenever GitHub rebuilds ubuntu-latest, and a suite starts failing on a
+      # PR that had nothing to do with it. Every other job here pins its toolchain.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6.5.0
+        with:
+          node-version: "22"
+      - name: Discover and run plugin JS test suites
+        shell: bash
+        run: |
+          # Same shape as the Python discovery above, and for the same reason: an
+          # empty result is a failure, not a pass.
+          #
+          # The second guard covers execution rather than discovery. `node <file>`
+          # exits 0 on a file that asserted nothing, so each suite must end with a
+          # `<n> assertions passed` line with n > 0 to count as having run. Last line
+          # rather than anywhere in the output: matched anywhere, a suite that printed
+          # its total and then kept going would still satisfy it.
+          #
+          # Only stdout is captured; stderr is left to flow through to the log. Merging
+          # them would put a node warning emitted at exit on the last line and turn a
+          # fully passing suite into "it ran nothing".
+          set -uo pipefail
+          mapfile -d '' suites < <(find plugins -type f -name '*.test.mjs' -print0 | sort -z)
+          if [ "${#suites[@]}" -eq 0 ]; then
+            echo "ERROR: no .test.mjs suites found — discovery is broken"
+            exit 1
+          fi
+          failed=0
+          for s in "${suites[@]}"; do
+            echo "::group::$s"
+            if out=$(node "$s"); then :; else failed=1; fi
+            echo "$out"
+            if ! tail -n 1 <<<"$out" | grep -qE '^[1-9][0-9]* assertions passed$'; then
+              echo "ERROR: $s did not end with an assertion count: it ran nothing"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          echo "Ran ${#suites[@]} JS suite(s)"
+          exit "$failed"
